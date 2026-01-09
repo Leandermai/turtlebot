@@ -1,0 +1,154 @@
+import cv2
+import rclpy
+from rclpy.node import Node
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+
+class Secret_tunnel(Node):
+    def __init__(self):
+        super().__init__('secret_tunnel')
+        # Get camera
+        self.subscription = self.create_subscription(
+            Image,
+            '/camera/image_raw',
+            self.image_callback,
+            2)
+        self.br = CvBridge()
+        cv2.namedWindow("camera", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("camera", 640, 480)
+    
+        # Get Laser data
+        self.subscriber = self.create_subscription(
+            LaserScan,
+            'scan',
+            self.laser_callback,
+            10
+        )
+
+        # Tell robot to drive
+        self.publisher = self.create_publisher(
+            Twist,
+            'cmd_vel',
+            10
+        )
+        self.timer = self.create_timer(0.4, self.timer_callback)
+    
+    # Global variables ----- ----- -----
+    scaleFactor = 0.3   # Downscale image size
+    heightThreshhold = int(1080 * scaleFactor / 2)
+    widthThreshhold = int(1940 * scaleFactor / 3)
+    tunelEntrance = False    # The flag that tells the bot when he has found he tunnel and has to navigate into it
+    ideal_center_close = 1440   # at 1030; values derived from cv_read_centers
+    close_line_height = 1030
+    ideal_center_far = 1400 # ideal center is 1400 for height 988 pixles
+    far_line_height = 988
+    state = 0   # State machine for entering the tunel
+
+    # Save the latest image
+    def image_callback(self, data):
+        self.latest_frame = cv2.resize(self.br.imgmsg_to_cv2(data), (0,0), fx=self.scaleFactor, fy=self.scaleFactor)
+        self.new_image = True
+
+    # Save the current laser data
+    def laser_callback(self, msg):
+        self.ranges = msg.ranges[20:60] # Distance range: 0.12 - 3.5
+
+    # Drive into the tunnel ----- ----- -----
+    def timer_callback(self):
+        current_frame = self.latest_frame
+
+        # If you are not at the entrance keep looking for it
+        if not self.tunelEntrance:
+
+            # Check wall
+            distance = min(self.ranges)
+            if (distance < 0.4):
+                checkWall = True
+                self.get_logger().info(f'Checking wall at: {distance}')
+            else:
+                checkWall = False
+
+            # If there is a wall, is there a sign on the wall?
+            if checkWall:
+                # IMPORTANT: to read frame[y,x] to paint cv2(x,y)
+                stepSize = 16   # maybe calculate based on threshhold or factor
+                for x in range(0, self.widthThreshhold, stepSize):
+                    for y in range(0, self.heightThreshhold, stepSize):
+                        if (current_frame[y, x][0] >= 225):
+                            cv2.circle(current_frame, (x,y), 3, (10, 10, 250), -1)
+                            self.tunelEntrance = True   # TODO: check if there needs to be confirmation to avoid false positive
+
+            # Paint whether check sign is detected
+            if checkWall:
+                cv2.circle(current_frame, (self.widthThreshhold+4, 10), 3, (25, 25, 250), -1)
+
+            # Act
+            msg = Twist()
+            msg.linear.x = 0.1
+            msg.angular.z = 0.0
+            self.publisher.publish(msg)
+            self.get_logger().info(f'Forward: {msg.linear.x}, Rotation: {msg.angular.z:.3f}')
+
+
+        else:
+            # then align with the straight line and drive forward
+            # Check on the right for wall
+            # bonus: use the wall in side to align ideally to pass through the tunnel
+            
+            # Align the robot to the line
+            if (self.state == 0):
+                # Measure position of the far point
+                far_line = []
+                for x in range(self.image_width - 1):
+                    if(x >= self.scan_start):
+                        if (current_frame[self.far_line_height, x][2] >= 225):
+                            far_line.append(x)
+                far_center = sum(far_line) / len(far_line)
+
+                # Measure position of the close point
+                close_line = []
+                for x in range(self.image_width - 1):
+                    if(x >= self.scan_start):
+                        if (current_frame[self.close_line_height, x][2] >= 225):
+                            close_line.append(x)
+                close_center = sum(close_line) / len(close_line)
+
+                # Align robot based on 2 points
+                # Align him with one for now
+                correction = self.ideal_center - self.line_center
+                if (correction < 0):
+                    correction *= 2 # normalize the left and right error to be equal in total magnitude
+                    correction /= (self.max_correction / 2.0)   # makes the angular.z max out at 2 for both sides
+                if (correction > 0.9):
+                    correction = 0.9
+                msg.angular.z = correction
+                msg.linear.x = 0.1
+
+
+                # Switch state once done
+                #threshhold = 0.05
+                #if msg.angular.z < threshhold:
+                #    state = 1
+            
+            msg = Twist()
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+            self.publisher.publish(msg)
+            self.get_logger().info(f'Secret Tunel!')
+
+        # Display
+        cv2.imshow("camera", current_frame)
+        cv2.waitKey(1)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    secret_tunnel = Secret_tunnel()
+    rclpy.spin(secret_tunnel)
+    secret_tunnel.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
